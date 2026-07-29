@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../../../VSCode"
+		},
+		{
+			"name": "ESP32_DHT22",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"iostream": "cpp",
+			"ostream": "cpp",
+			"iomanip": "cpp",
+			"algorithm": "cpp"
+		}
+	}
+}
