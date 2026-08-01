@@ -139,3 +139,26 @@ Các thông tin sau không được lưu trên GitHub:
 - ThingsBoard access token.
 - API keys.
 - Private credentials.
+## Deep Sleep
+
+The device operates using the following cycle:
+
+1. Wake up.
+2. Read temperature and humidity.
+3. Connect to Wi-Fi.
+4. Connect to ThingsBoard.
+5. Publish telemetry.
+6. Disconnect Wi-Fi.
+7. Enter Deep Sleep.
+8. Wake up using the RTC timer.
+
+The test sleep interval is 30 seconds.
+
+Telemetry keys:
+
+- temperature
+- humidity
+- temperatureAlarm
+- humidityAlarm
+- rssi
+- wakeCount
