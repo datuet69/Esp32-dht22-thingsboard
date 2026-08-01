@@ -2,9 +2,12 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <DHT.h>
+#include <esp_sleep.h>
 #include "secrets.h"
 #define DHT_PIN 4
 #define DHT_TYPE DHT22
+
+DHT dht(DHT_PIN, DHT_TYPE);
 
 constexpr float TEMPERATURE_OFFSET = -2.0F;
 constexpr float HUMIDITY_OFFSET = 0.0F;
@@ -12,31 +15,52 @@ constexpr float HUMIDITY_OFFSET = 0.0F;
 constexpr float TEMPERATURE_HIGH_LIMIT = 35.0F;
 constexpr float HUMIDITY_HIGH_LIMIT = 85.0F;
 
-constexpr unsigned long SEND_INTERVAL_MS = 5000UL;
+constexpr char THINGSBOARD_SERVER[] =
+    "eu.thingsboard.cloud";
 
-
-constexpr char THINGSBOARD_SERVER[] = "eu.thingsboard.cloud";
 constexpr uint16_t THINGSBOARD_PORT = 1883;
 
 constexpr char TELEMETRY_TOPIC[] =
     "v1/devices/me/telemetry";
 
+// Deep Sleep
+constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
+
+// Để 30 giây khi thử nghiệm
+constexpr uint64_t SLEEP_TIME_SECONDS = 30ULL;
+
+// Biến này giữ được qua Deep Sleep
+RTC_DATA_ATTR unsigned int wakeCount = 0;
+
+// Thời gian timeout
+
+constexpr unsigned long WIFI_TIMEOUT_MS = 15000UL;
+constexpr unsigned long MQTT_TIMEOUT_MS = 10000UL;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-DHT dht(DHT_PIN, DHT_TYPE);
 
-unsigned long previousSendTime = 0;
+String createMqttClientId()
+{
+    const uint64_t chipId = ESP.getEfuseMac();
 
-// Kết nối Wi-Fi
+    String clientId = "esp32-dht22-";
+
+    clientId += String(
+        static_cast<uint32_t>(chipId >> 32),
+        HEX
+    );
+
+    clientId += String(
+        static_cast<uint32_t>(chipId),
+        HEX
+    );
+
+    return clientId;
+}
 
 bool connectWiFi()
 {
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        return true;
-    }
-
     Serial.println();
     Serial.print("Dang ket noi Wi-Fi: ");
     Serial.println(WIFI_SSID);
@@ -45,25 +69,24 @@ bool connectWiFi()
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     const unsigned long startTime = millis();
-    const unsigned long timeoutMs = 15000UL;
 
     while (WiFi.status() != WL_CONNECTED)
     {
-        if (millis() - startTime >= timeoutMs)
+        if (millis() - startTime >= WIFI_TIMEOUT_MS)
         {
             Serial.println();
-            Serial.println("Ket noi Wi-Fi that bai!");
+            Serial.println("Ket noi Wi-Fi that bai: Het thoi gian cho.");
             return false;
         }
 
-        delay(500);
         Serial.print(".");
+        delay(500);
     }
 
     Serial.println();
     Serial.println("Wi-Fi connected!");
 
-    Serial.print("IP address: ");
+    Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
     Serial.print("RSSI: ");
@@ -73,85 +96,65 @@ bool connectWiFi()
     return true;
 }
 
-// Tạo Client ID 
-
-String createMqttClientId()
-{
-    const uint64_t chipId = ESP.getEfuseMac();
-
-    String clientId = "esp32-dht22-";
-    clientId += String(
-        static_cast<uint32_t>(chipId >> 32),
-        HEX
-    );
-    clientId += String(
-        static_cast<uint32_t>(chipId),
-        HEX
-    );
-
-    return clientId;
-}
-
-// Kết nối ThingsBoard 
-
 bool connectThingsBoard()
 {
-    if (mqttClient.connected())
-    {
-        return true;
-    }
-
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        return false;
-    }
-
-    Serial.println("Dang ket noi ThingsBoard...");
+    mqttClient.setServer(
+        THINGSBOARD_SERVER,
+        THINGSBOARD_PORT
+    );
 
     const String clientId = createMqttClientId();
 
-    const bool connected = mqttClient.connect(
-        clientId.c_str(),
-        THINGSBOARD_TOKEN,
-        ""
-    );
+    Serial.println("Dang ket noi ThingsBoard...");
 
-    if (connected)
+    const unsigned long startTime = millis();
+
+    while (!mqttClient.connected())
     {
-        Serial.println("ThingsBoard connected!");
-        return true;
+        const bool connected = mqttClient.connect(
+            clientId.c_str(),
+            THINGSBOARD_TOKEN,
+            ""
+        );
+
+        if (connected)
+        {
+            Serial.println("ThingsBoard connected!");
+            return true;
+        }
+
+        Serial.print("MQTT state: ");
+        Serial.println(mqttClient.state());
+
+        if (millis() - startTime >= MQTT_TIMEOUT_MS)
+        {
+            Serial.println(
+                "Ket noi ThingsBoard that bai: Het thoi gian cho."
+            );
+            return false;
+        }
+
+        delay(1000);
     }
 
-    Serial.print("ThingsBoard connection failed. MQTT state: ");
-    Serial.println(mqttClient.state());
-
-    return false;
+    return true;
 }
 
 
-// Đọc cảm biến và gửi dữ liệu
-
-void sendTelemetry()
+bool sendTelemetry(
+    const float temperature,
+    const float humidity
+)
 {
-    float humidity = dht.readHumidity();
-    float temperature = dht.readTemperature();
-
-    if (isnan(temperature) || isnan(humidity))
-    {
-        Serial.println("Khong doc duoc du lieu tu DHT22!");
-        return;
-    }
-
-    temperature += TEMPERATURE_OFFSET;
-    humidity += HUMIDITY_OFFSET;
-
     const bool temperatureAlarm =
         temperature > TEMPERATURE_HIGH_LIMIT;
 
     const bool humidityAlarm =
         humidity > HUMIDITY_HIGH_LIMIT;
 
-    char payload[256];
+    const long rssi = WiFi.RSSI();
+
+    char payload[300];
 
     const int payloadLength = snprintf(
         payload,
@@ -161,30 +164,38 @@ void sendTelemetry()
         "\"humidity\":%.2f,"
         "\"temperatureAlarm\":%s,"
         "\"humidityAlarm\":%s,"
-        "\"rssi\":%ld"
+        "\"rssi\":%ld,"
+        "\"wakeCount\":%u"
         "}",
         temperature,
         humidity,
         temperatureAlarm ? "true" : "false",
         humidityAlarm ? "true" : "false",
-        static_cast<long>(WiFi.RSSI())
+        rssi,
+        wakeCount
     );
 
-    if (payloadLength <= 0 ||
-        payloadLength >= static_cast<int>(sizeof(payload)))
+    if (
+        payloadLength <= 0 ||
+        payloadLength >= static_cast<int>(sizeof(payload))
+    )
     {
-        Serial.println("Loi tao JSON telemetry!");
-        return;
+        Serial.println("Loi tao du lieu JSON.");
+        return false;
     }
 
     Serial.println();
-    Serial.println("Du lieu chuan bi gui:");
+    Serial.println("Du lieu gui len ThingsBoard:");
     Serial.println(payload);
 
     const bool success = mqttClient.publish(
         TELEMETRY_TOPIC,
         payload
     );
+
+    mqttClient.loop();
+
+    delay(500);
 
     if (success)
     {
@@ -194,60 +205,117 @@ void sendTelemetry()
     {
         Serial.println("Gui telemetry that bai!");
     }
+
+    return success;
 }
 
-// setup
+void disconnectConnections()
+{
+    if (mqttClient.connected())
+    {
+        mqttClient.disconnect();
+    }
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    delay(100);
+}
+
+void enterDeepSleep()
+{
+    Serial.println();
+    Serial.print("ESP32 se ngu trong ");
+    Serial.print(SLEEP_TIME_SECONDS);
+    Serial.println(" giay.");
+
+    disconnectConnections();
+
+    esp_sleep_enable_timer_wakeup(
+        SLEEP_TIME_SECONDS * MICROSECONDS_PER_SECOND
+    );
+
+    Serial.println("Bat dau Deep Sleep...");
+    Serial.flush();
+
+    esp_deep_sleep_start();
+}
+
+
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+
+    // Dùng 3 giây trong giai đoạn thử nghiệm
+    delay(3000);
+
+    wakeCount++;
 
     Serial.println();
-    Serial.println("==============================");
-    Serial.println("ESP32 DHT22 ThingsBoard");
-    Serial.println("==============================");
+    Serial.println("=======================================");
+    Serial.println("ESP32 DHT22 THINGSBOARD DEEP SLEEP");
+    Serial.println("=======================================");
 
+    Serial.print("Lan khoi dong/thuc day: ");
+    Serial.println(wakeCount);
+
+    // ---------------------------------------------
+    // Bước 1: Khởi động và đọc DHT22
+    // ---------------------------------------------
     dht.begin();
 
-    mqttClient.setServer(
-        THINGSBOARD_SERVER,
-        THINGSBOARD_PORT
+    // Chờ cảm biến ổn định
+    delay(2000);
+
+    float humidity = dht.readHumidity();
+    float temperature = dht.readTemperature();
+
+    if (isnan(temperature) || isnan(humidity))
+    {
+        Serial.println("Loi: Khong doc duoc du lieu DHT22.");
+
+        // Không để ESP32 chạy mãi khi cảm biến lỗi
+        enterDeepSleep();
+    }
+
+    temperature += TEMPERATURE_OFFSET;
+    humidity += HUMIDITY_OFFSET;
+
+    Serial.println();
+    Serial.println("Du lieu cam bien:");
+
+    Serial.print("Nhiet do: ");
+    Serial.print(temperature, 2);
+    Serial.println(" do C");
+
+    Serial.print("Do am: ");
+    Serial.print(humidity, 2);
+    Serial.println(" %");
+
+
+
+    if (!connectWiFi())
+    {
+        enterDeepSleep();
+    }
+
+
+    if (!connectThingsBoard())
+    {
+        enterDeepSleep();
+    }
+
+   
+    sendTelemetry(
+        temperature,
+        humidity
     );
 
-    mqttClient.setKeepAlive(60);
 
-    connectWiFi();
+    enterDeepSleep();
 }
-// loop
+
 void loop()
 {
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        if (!connectWiFi())
-        {
-            delay(3000);
-            return;
-        }
-    }
-
-    if (!mqttClient.connected())
-    {
-        if (!connectThingsBoard())
-        {
-            delay(3000);
-            return;
-        }
-    }
-
-    mqttClient.loop();
-
-    const unsigned long currentTime = millis();
-
-    if (currentTime - previousSendTime >= SEND_INTERVAL_MS)
-    {
-        previousSendTime = currentTime;
-        sendTelemetry();
-    }
-
-    delay(10);
+    
 }
